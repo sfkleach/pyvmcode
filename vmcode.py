@@ -1,7 +1,12 @@
 # Example of a abstract machine interface.
 
-from abc import abstractmethod
-from collections import namedtuple
+from abc import abstractmethod, ABC
+from inspect import signature
+from collections import deque
+from typing import Deque, Dict, Any
+
+
+ENVIRONMENT: Dict[str, Any] = {}
 
 class Engine:
 
@@ -10,7 +15,7 @@ class Engine:
         self.code = ()
         self.pc = 0
         self.locals = {}
-        self.globals = {}
+        self.globals = ENVIRONMENT
         self.dump = []
 
     def run(self):
@@ -23,42 +28,25 @@ class Engine:
     def returnValues(self):
         return tuple(self.value_stack)
 
-    # def leave(self, _fn: 'Function'):
-    #     self.locals = self.dump.pop()
-    #     self.pc = self.dump.pop()
-    #     self.code = self.dump.pop()
-
-    # def enter(self, _fn: 'Function'):
-    #     self.dump.append(self.locals)
-    #     self.locals = {}
-
     def callq(self, fn: 'Function'):
         self.dump.append(self.code)
         self.dump.append(self.pc)
         self.code = fn.code()
         self.pc = 0
 
+    def sys_callq_Nto1(self, nargs, fn):
+        d: Deque = deque()
+        for _ in range(nargs):
+            d.appendleft(self.value_stack.pop())
+        self.value_stack.append(fn(*d))
+
+    def sys_callq_2to1(self, fn):
+        y = self.value_stack.pop()
+        x = self.value_stack.pop()
+        self.value_stack.append(fn(x, y))
+
     def pushq(self, value):
         self.value_stack.append(value)
-
-    # def pop_local(self, name: str):
-    #     self.locals[name] = self.value_stack.pop()
-
-    # def push_local(self, name: str):
-    #     self.value_stack.append(self.locals[name])
-
-    # def pop_global(self, name: str):
-    #     self.globals[name] = self.value_stack.pop()
-
-    # def push_global(self, name: str):
-    #     self.value_stack.append(self.globals[name])
-
-    # def jump(self, label: int):
-    #     self.pc = label
-
-    # def jump_if_not(self, label: int):
-    #     if not self.value_stack.pop():
-    #         self.pc = label
 
 def inst_leave(engine: Engine):
     engine.locals = engine.dump.pop()
@@ -74,6 +62,27 @@ def inst_callq(engine: Engine, fn: 'Function'):
     engine.dump.append(engine.pc)
     engine.code = fn.code()
     engine.pc = 0
+
+def inst_sys_callq_Nto1(engine: Engine):
+    fn = engine.code[engine.pc]
+    nargs = fn.nargs()
+    d: Deque = deque()
+    for _ in range(nargs):
+        d.appendleft(engine.value_stack.pop())
+    engine.value_stack.push(fn(*d))
+    engine.pc += 1
+
+def inst_sys_callq_2to1(engine: Engine):
+    fn = engine.code[engine.pc]
+    y = engine.value_stack.pop()
+    x = engine.value_stack.pop()
+    engine.value_stack.append(fn(x, y))
+    engine.pc += 1
+
+def inst_sys_callq_0to1(engine: Engine):
+    fn = engine.code[engine.pc]
+    engine.value_stack.push(fn())
+    engine.pc += 1
 
 def inst_pushq(engine: Engine):
     engine.value_stack.append(engine.code[engine.pc])
@@ -108,7 +117,54 @@ def inst_jump_if_not(engine: Engine):
     else:
         engine.pc += 1
 
-class Function:
+class Procedure(ABC):
+    @abstractmethod
+    def callq(self, engine: Engine):
+        ...
+
+    @abstractmethod
+    def show(self):
+        ...
+
+    @abstractmethod
+    def __call__(self, *args):
+        ...
+
+class SysFn(Procedure):
+
+    def __init__(self, fn):
+        self._fn = fn
+
+    def nargs(self):
+        return len(signature(self._fn).parameters)
+
+    def show(self):
+        print(f'SysNto1: {self._fn}')
+
+    def __call__(self, *args):
+        return self._fn(*args)
+
+class SysNto1(SysFn):
+
+    def __init__(self, fn):
+        super().__init__(fn)
+        self._nargs = len(signature(fn).parameters)
+
+    def nargs(self):
+        return self._nargs
+
+    def callq(self, engine: Engine):
+        engine.sys_callq_Nto1(self._nargs, self._fn)
+
+class Sys2to1(SysNto1):
+
+    def nargs(self):
+        return 2
+
+    def callq(self, engine: Engine):
+        engine.sys_callq_2to1(self._fn)
+
+class Function(Procedure):
 
     def __init__(self):
         self._code = ()
@@ -120,6 +176,9 @@ class Function:
     def code(self):
         return self._code
 
+    def callq(self, engine: Engine):
+        engine.callq(self)
+
     def __call__(self, *args):
         engine = Engine()
         for arg in args:
@@ -127,7 +186,7 @@ class Function:
         engine.callq(self)
         engine.run()
         return engine.returnValues()
-    
+
     def show(self):
         for n, i in enumerate(self._code):
             print(f'{n}: {i}')
@@ -207,6 +266,22 @@ class CodePlanter:
     def PUSHQ(self, value):
         self._code.append(inst_pushq)
         self._code.append(value)
+        return self
+
+    def CALLQ(self, fn: Procedure):
+        if isinstance(fn, Function):
+            self._code.append(inst_callq)
+            self._code.append(fn)
+        elif isinstance(fn, SysNto1):
+            if fn.nargs() == 0:
+                self._code.append(inst_sys_callq_0to1)
+            elif fn.nargs() == 2:
+                self._code.append(inst_sys_callq_2to1)
+            else:
+                self._code.append(inst_sys_callq_Nto1)
+            self._code.append(fn)
+        else:
+            raise RuntimeError(f'Unknown procedure type: {fn}')
         return self
 
     def _set(self, n, offset):
@@ -301,7 +376,7 @@ class CodePlanter:
         state = yield
         if state != 'ENDWHILE':
             raise RuntimeError(f'Expecting ENDWHILE but got: {state}')
-        
+
         self._code.append(inst_jump)
         self._plant_label(startwhile_label)
 
@@ -332,4 +407,5 @@ class FunctionBuilder(CodePlanter):
         f.init_code(tuple(self._code))
         return f
 
-
+ENVIRONMENT['>'] = Sys2to1(lambda x, y: x > y)
+ENVIRONMENT['<'] = Sys2to1(lambda x, y: x < y)
